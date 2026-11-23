@@ -1,0 +1,32 @@
+<!-- Worked example (fictional client "Acme"): a goals slide composed from blocks (b-stats with count-ups, b-tl that draws, b-card with the gap and the client quote). Passes every gate at 66.9% fill; add a fourth element (proof strip or source line) to clear 70%. Never copy its words: its numbers and names are invented for the example. -->
+<!-- prefix: gl -->
+<style>
+.slide{gap:34px!important}
+.gl-g{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,.75fr);gap:28px;flex:1;min-height:0}
+.gl-l{display:flex;flex-direction:column;gap:26px;min-height:0}
+.gl-r{display:flex;flex-direction:column;gap:18px}
+.gl-r .b-card{flex:1}
+</style>
+<section class="slide" id="goals" data-layout="stat-row" aria-label="Where you want to be">
+  <div class="hd"><div class="eyebrow in">Where you want to be</div>
+  <h2 class="in" style="--d:.1s">Break even in 2027 with <span class="hl">organisers paying for it</span></h2></div>
+  <div class="gl-g">
+    <div class="gl-l">
+      <div class="b-stats">
+        <div class="b-stat in" style="--d:.3s"><span class="b-k">Revenue goal</span><b class="b-num" data-count="1" data-pre="&#163;" data-suf="m">&#163;1m</b><h3 class="b-h">ARR from organisers</h3><p class="b-d">By December 2027, from Acme's event customers.</p></div>
+        <div class="b-stat in" style="--d:.42s"><span class="b-k">Organisers</span><b class="b-num" data-count="40">40</b><h3 class="b-h">Paying organisers</h3><p class="b-d">At about &#163;25k a year each, outside your top 50.</p></div>
+      </div>
+      <div class="b-tl in" style="--d:.5s;--n:4" data-draw>
+        <div class="b-tl-bar"></div>
+        <div class="b-tl-i now" style="--k:0"><div><span class="b-k">Nov 2026</span><h3 class="b-h">2 live</h3><p class="b-d">Easyfairs and one pilot.</p></div></div>
+        <div class="b-tl-i" style="--k:1"><div><span class="b-k">Mar 2027</span><h3 class="b-h">10 organisers</h3><p class="b-d">First wave from the tests.</p></div></div>
+        <div class="b-tl-i" style="--k:2"><div><span class="b-k">Jul 2027</span><h3 class="b-h">25 organisers</h3><p class="b-d">Winning tests scaled.</p></div></div>
+        <div class="b-tl-i" style="--k:3"><div><span class="b-k">Dec 2027</span><h3 class="b-h">&#163;1m ARR</h3><p class="b-d">Break even.</p></div></div>
+      </div>
+    </div>
+    <div class="gl-r">
+      <div class="b-card on-acc in" style="--d:.6s"><span class="b-k">The gap</span><h3 class="b-h">38 more organisers</h3><p class="b-d">Sam closes the top 50 one by one. The rest of the market needs a repeatable play, tested in small batches.</p></div>
+      <div class="b-card in" style="--d:.7s"><span class="b-k">In your words</span><h3 class="b-h">"Getting someone to open it"</h3><p class="b-d">Sam on the call: reach, not product, is the limit. Every test here is built around that.</p></div>
+    </div>
+  </div>
+</section>

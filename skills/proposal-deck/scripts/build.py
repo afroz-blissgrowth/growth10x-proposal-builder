@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""Assemble a Growth10x proposal deck from the template shell, the component library and slide part files.
+
+Usage:
+  python3 build.py <deck_dir> [--theme dark|light|both] [--review] [--white-label] [--out FILE] [--only id,id] [--lint-only]
+
+--review (or "review": true in deck.json with no --theme given) builds the pilot review file: every slide
+once in light theme, then the same slides again in dark theme (ids suffixed -d), in ONE file. The shell
+switches <html data-theme> to each slide's data-theme as you move through it. 3 slides give 6.
+
+<deck_dir>/deck.json (see references/build-and-qa.md for the full schema):
+  {"client": "Acme", "slug": "acme", "prepared_for": "Sam", "month_year": "December 2026",
+   "accent": "#2F80ED", "theme": "dark", "white_label": false, "title": "Acme growth plan",
+   "logo": {"dark": "assets/logo-light.png", "light": "assets/logo-dark.png"},
+   "slides": ["slides/01-cover.html", ...], "mockups": ["mockups/mz-ai.html", ...]}
+
+Slide part file: optional <!-- prefix: xx --> comment, optional <style> blocks (scoped to the slide
+by this script), then exactly one <section class="slide ..." id="...">. Mockup part: optional
+<style>, then one <div class="mz" id="mz-..."> (scoped to the mockup).
+
+Writes <deck_dir>/build/<slug>-<theme>.html and <deck_dir>/build/lint-<theme>.json
+(review: <slug>-review.html and lint-review.json).
+Exit code 1 if lint finds errors. Python 3 stdlib only.
+"""
+import argparse, base64, colorsys, json, mimetypes, os, re, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SKILL = os.path.dirname(HERE)
+SHELL = os.path.join(SKILL, 'assets', 'template-shell.html')
+COMPONENTS = os.path.join(SKILL, 'assets', 'components.html')
+ICONS = os.path.join(SKILL, 'assets', 'icons.svg')
+sys.path.insert(0, HERE)
+from csskit import parse_css, serialize, classes_in, split_top  # noqa: E402
+
+# classes added by JS or by the shell at runtime: never tree-shaken, never "undefined"
+RUNTIME = {'on', 'vis', 'show', 'instant', 'open', 'sel', 'hov', 'cov', 'wl', 'lit', 'in', 'g10x-icons'}
+GENERIC = {'a', 'b', 'c', 'd', 'e', 'm', 't', 'x', 'y', 'n', 'p', 'r', 's', 'L', 'S', 'st', 'dn', 'up', 'on', 'cp',
+           'active', 'big', 'small', 'item', 'card', 'row', 'col', 'box', 'title', 'label', 'text', 'left', 'right',
+           'top', 'bottom', 'wrap', 'inner', 'list', 'grid', 'icon', 'num', 'acc', 'gap', 'first', 'last'}
+
+# ---------------------------------------------------------------- colour maths
+INK, PAPER, DARK_BG, LIGHT_BG = (23, 22, 29), (251, 250, 247), (23, 22, 29), (250, 249, 245)
+
+def hex2rgb(h):
+    h = h.strip().lstrip('#')
+    if len(h) == 3: h = ''.join(c * 2 for c in h)
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+def rgb2hex(c): return '#%02X%02X%02X' % tuple(max(0, min(255, round(v))) for v in c)
+
+def lum(c):
+    def ch(v):
+        v /= 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = (ch(v) for v in c)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+def contrast(a, b):
+    la, lb = lum(a), lum(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+def mix(a, b, t): return tuple(a[i] + (b[i] - a[i]) * t for i in range(3))
+
+def toward(acc, ground, target, to):
+    for k in range(0, 101):
+        c = mix(acc, to, k / 100.0)
+        if contrast(c, ground) >= target: return c
+    return to
+
+def accent_tokens(hexacc):
+    acc = hex2rgb(hexacc)
+    out = {}
+    for theme, ground in (('dark', DARK_BG), ('light', LIGHT_BG)):
+        fill = acc
+        if theme == 'light' and contrast(acc, ground) < 2.2:      # pale accents get a deeper fill on light ground
+            fill = toward(acc, ground, 2.2, INK)
+        if theme == 'dark' and contrast(acc, ground) < 2.2:       # very dark accents get lifted on dark ground
+            fill = toward(acc, ground, 2.2, (255, 255, 255))
+        cw, ci = contrast(fill, (255, 255, 255)), contrast(fill, INK)
+        # text on accent fills is large (highlights, pills, numbers): prefer white on mid and dark accents
+        on = (255, 255, 255) if (cw >= 3.0 and cw >= ci - 1.0) or cw >= ci else INK
+        tx = toward(fill, ground, 5.2,  # 5.2 on the bare ground keeps accent text above 4.5 on glass and tinted panels
+                     (255, 255, 255) if theme == 'dark' else INK)
+        out[theme] = {'--acc': rgb2hex(fill), '--acc-rgb': '%d,%d,%d' % tuple(round(v) for v in fill),
+                      '--on-acc': rgb2hex(on), '--acc-tx': rgb2hex(tx)}
+    out['paper'] = {'--acc-ink': rgb2hex(toward(acc, PAPER, 4.8, INK)), '--acc-mid': rgb2hex(toward(acc, PAPER, 3.0, INK)),
+                    '--acc-pale': rgb2hex(mix(PAPER, acc, .22))}
+    return out
+
+def accent_css(hexacc):
+    t = accent_tokens(hexacc)
+    d = ';'.join('%s:%s' % kv for kv in list(t['dark'].items()) + list(t['paper'].items()))
+    l = ';'.join('%s:%s' % kv for kv in t['light'].items())
+    return ('/* ACCENT: generated by build.py from the client colour %s */\n:root{%s}\nhtml[data-theme="light"]{%s}'
+            % (hexacc, d, l)), t
+
+# ---------------------------------------------------------------- helpers
+def read(p): return open(p, encoding='utf-8').read()
+
+def data_uri(path):
+    mt = mimetypes.guess_type(path)[0] or 'image/png'
+    if path.endswith('.svg'): mt = 'image/svg+xml'
+    return 'data:%s;base64,%s' % (mt, base64.b64encode(open(path, 'rb').read()).decode())
+
+def strip_comments(h): return re.sub(r'<!--(?!\s*@component).*?-->', '', h, flags=re.S)
+
+def remove_marked(h, attr='data-g10x'):
+    """Remove every element carrying attr (balanced on its own tag name)."""
+    while True:
+        m = re.search(r'<([a-zA-Z][\w-]*)\b[^>]*\s' + attr + r'\b[^>]*>', h)
+        if not m: return h
+        tag, i, depth, j = m.group(1), m.end(), 1, m.end()
+        if m.group(0).endswith('/>') or tag.lower() in ('img', 'br', 'hr', 'input', 'meta', 'link'):
+            h = h[:m.start()] + h[m.end():]; continue
+        pat = re.compile(r'<(/?)' + tag + r'\b[^>]*>')
+        while depth:
+            n = pat.search(h, j)
+            if not n: raise SystemExit('unbalanced <%s> while removing %s' % (tag, attr))
+            depth += -1 if n.group(1) else 1
+            j = n.end()
+        h = h[:m.start()] + h[j:]
+
+def scope_css(css, scope, prefix_check=None):
+    """Prefix every selector with the slide or mockup id."""
+    nodes = parse_css(css)
+    def sc(ns):
+        for nd in ns:
+            if nd['t'] == 'rule':
+                sels = []
+                for s in split_top(nd['sel'], ','):
+                    s = s.strip()
+                    if s.startswith(scope): sels.append(s)
+                    elif re.match(r'\.(slide|mz)(?![\w-])', s): sels.append(scope + re.sub(r'^\.(slide|mz)', '', s))
+                    else: sels.append(scope + ' ' + s)
+                nd['sel'] = ','.join(sels)
+            elif nd['t'] == 'at':
+                sc(nd['children'])
+    sc(nodes)
+    return serialize(nodes)
+
+def dedupe_css(css):
+    """Cascade-safe clean-up: drop exact duplicate rules and declarations overridden later by the same selector."""
+    nodes = parse_css(css)
+    flat = []
+    def walk(ns, media):
+        for nd in ns:
+            if nd['t'] == 'rule': flat.append((media, nd))
+            elif nd['t'] == 'at': walk(nd['children'], media + (nd['prelude'],))
+    walk(nodes, ())
+    last = {}
+    for idx, (media, nd) in enumerate(flat):
+        for s in split_top(nd['sel'], ','):
+            for p, v, imp in nd['decls']:
+                last.setdefault((media, s.strip(), p), []).append((idx, imp))
+    for idx, (media, nd) in enumerate(flat):
+        sels = [s.strip() for s in split_top(nd['sel'], ',')]
+        if len(sels) != 1: continue
+        keep = []
+        for p, v, imp in nd['decls']:
+            later = [k for k in last[(media, sels[0], p)] if k[0] > idx]
+            if later and (not imp or any(x[1] for x in later)): continue
+            keep.append((p, v, imp))
+        nd['decls'] = keep
+    out = serialize(nodes)
+    seen, lines = set(), []
+    for line in out.split('\n'):
+        key = line.strip()
+        if key and '{' in key and key.endswith('}') and not key.startswith('@') and key in seen: continue
+        seen.add(key); lines.append(line)
+    return '\n'.join(lines)
+
+def tree_shake(css, html):
+    present = set(RUNTIME)
+    for c in re.findall(r'class="([^"]*)"', html): present.update(c.split())
+    for c in re.findall(r"classList\.(?:add|toggle|remove)\('([\w-]+)'", html): present.add(c)
+    ids = set(re.findall(r'id="([^"]+)"', html))
+    nodes = parse_css(css)
+    used_kf = set()
+    def keep_sel(s):
+        if any(c not in present for c in classes_in(s)): return False
+        for i in re.findall(r'#([A-Za-z][\w-]*)', re.sub(r'"[^"]*"', '', s)):
+            if i not in ids: return False
+        return True
+    def walk(ns):
+        out = []
+        for nd in ns:
+            if nd['t'] == 'rule':
+                sels = [s.strip() for s in split_top(nd['sel'], ',') if keep_sel(s.strip())]
+                if sels:
+                    nd['sel'] = ','.join(sels); out.append(nd)
+                    for p, v, imp in nd['decls']:
+                        if p in ('animation', 'animation-name'): used_kf.update(re.findall(r'[A-Za-z][\w-]*', v))
+            elif nd['t'] == 'at':
+                nd['children'] = walk(nd['children'])
+                if nd['children']: out.append(nd)
+            else:
+                out.append(nd)
+        return out
+    nodes = walk(nodes)
+    nodes = [n for n in nodes if not (n['t'] == 'raw' and n.get('name') == 'keyframes' and n['prelude'].split()[1] not in used_kf)]
+    return serialize(nodes)
+
+# ---------------------------------------------------------------- review (light then dark in one file)
+REVIEW_SUFFIX = '-d'
+ID_ATTRS = re.compile(r'(\s(?:id|for|aria-labelledby|aria-describedby|aria-controls|aria-owns)=")([^"]+)(")')
+
+def set_section_theme(markup, theme):
+    """Add data-theme to the slide's own <section> tag (the first one in the part)."""
+    return re.sub(r'<section\b([^>]*?)\s*>', lambda m: '<section%s data-theme="%s">' % (m.group(1), theme), markup, count=1)
+
+def dark_copy(markup, idmap, n_slides):
+    """Copy of the slide markup with every id renamed through idmap and every reference to it updated.
+    Numeric data-go targets move to the matching dark slide (+n_slides)."""
+    def ids(m): return m.group(1) + ' '.join(idmap.get(t, t) for t in m.group(2).split()) + m.group(3)
+    h = ID_ATTRS.sub(ids, markup)
+    def go(m):
+        g = m.group(1)
+        return 'data-go="%s"' % (str(int(g) + n_slides) if g.isdigit() else idmap.get(g, g))
+    h = re.sub(r'data-go="([^"]+)"', go, h)
+    h = re.sub(r'((?:xlink:)?href=")#([^"]+)(")', lambda m: m.group(1) + '#' + idmap.get(m.group(2), m.group(2)) + m.group(3), h)
+    h = re.sub(r'url\(\s*([\'"]?)#([\w-]+)\1\s*\)', lambda m: 'url(%s#%s%s)' % (m.group(1), idmap.get(m.group(2), m.group(2)), m.group(1)), h)
+    return h
+
+def dup_id_css(h, idmap):
+    """For every CSS selector that names an id in idmap (#cover, #goals, inner ids), add the same selector
+    with the -d ids, in place, so the dark copies get exactly the same per-id rules."""
+    if not idmap: return h
+    pat = re.compile(r'#(%s)(?![\w-])' % '|'.join(re.escape(i) for i in sorted(idmap, key=len, reverse=True)))
+    def fix(nodes):
+        for nd in nodes:
+            if nd['t'] == 'rule':
+                sels = [x.strip() for x in split_top(nd['sel'], ',')]
+                extra = [pat.sub(lambda m: '#' + idmap[m.group(1)], x) for x in sels if pat.search(x)]
+                if extra: nd['sel'] = ','.join(sels + [x for x in extra if x not in sels])
+            elif nd['t'] == 'at':
+                fix(nd['children'])
+    def block(m):
+        css = m.group(2)
+        if not pat.search(re.sub(r'url\([^)]*\)', '', css)): return m.group(0)
+        nodes = parse_css(css); fix(nodes)
+        return m.group(1) + '\n' + serialize(nodes) + '\n' + m.group(3)
+    return re.sub(r'(<style\b[^>]*>)(.*?)(</style>)', block, h, flags=re.S)
+
+def base_id(sid): return sid[:-len(REVIEW_SUFFIX)] if sid.endswith(REVIEW_SUFFIX) else sid
+
+# ---------------------------------------------------------------- lint
+DASH = re.compile('[\u2013\u2014]|&mdash;|&ndash;|&#821[12];|&#x201[34];', re.I)
+
+def visible_text(h):
+    h = re.sub(r'<(script|style)\b.*?</\1>', ' ', h, flags=re.S)
+    h = re.sub(r'<[^>]+>', ' ', h)
+    return re.sub(r'\s+', ' ', h)
+
+def lint(html, cfg, slide_parts, mockup_parts, final_css):
+    E, W = [], []
+    body = html[html.index('<body'):]
+    text = visible_text(body)
+    # 1 dashes anywhere in the file (copy, CSS comments, attributes)
+    for m in DASH.finditer(html):
+        E.append('dash: em or en dash near "%s"' % html[max(0, m.start() - 40):m.end() + 20].replace('\n', ' '))
+    # 2 notes and internal markers
+    if re.search(r'<aside\b|id="notes"|class="[^"]*\bnotes\b|data-notes', body): E.append('notes: speaker or internal notes element found')
+    for word in ('Check:', 'TODO', 'TBC', 'TBD', 'FIXME', 'lorem', 'Lorem', '{{', '}}', 'XX'):
+        if word in text: E.append('internal marker or placeholder in visible text: %r' % word)
+    if re.search(r'\bRecommended\b', text): E.append('house rule: no "Recommended" pills or badges (say "our pick" in copy)')
+    if re.search(r'\bagency\b', text, re.I): W.append('house rule: Growth10x is a growth partner, not an agency')
+    if re.search(r'kick-?off', text, re.I): W.append('house rule: avoid "kick-off"')
+    # 3 navigation targets
+    slide_ids = re.findall(r'<section\b[^>]*\bid="([^"]+)"', body)
+    mz_ids = re.findall(r'<div\b[^>]*class="mz[" ][^>]*\bid="([^"]+)"|<div\b[^>]*\bid="([^"]+)"[^>]*class="mz[" ]', body)
+    mz_ids = [a or b for a, b in mz_ids]
+    for g in re.findall(r'data-go="([^"]+)"', body):
+        if not (g in slide_ids or (g.isdigit() and 1 <= int(g) <= len(slide_ids))): E.append('data-go target missing: %s' % g)
+    opens = re.findall(r'data-open="([^"]+)"', body)
+    for o in opens:
+        if o not in mz_ids: E.append('data-open target missing: %s' % o)
+    for z in mz_ids:
+        if z not in opens: W.append('mockup never opened by a data-open button: %s' % z)
+    if 'cover' not in slide_ids: E.append('no slide with id="cover"')
+    allids = re.findall(r'\sid="([^"]+)"', body)
+    dup = sorted(set(i for i in allids if allids.count(i) > 1))
+    if dup: E.append('duplicate ids: %s' % ', '.join(dup))
+    if 'thanks' not in slide_ids: W.append('no slide with id="thanks"')
+    # 4 every mockup labelled Illustrative
+    for z in mz_ids:
+        m = re.search(r'id="%s"(.*?)<div class="mz-hd">(.*?)</div>' % re.escape(z), body, re.S)
+        hd = m.group(2) if m else ''
+        if 'Illustrative' not in hd: E.append('mockup %s: header tag must say Illustrative' % z)
+    # 5 class prefixes and generic collisions in part CSS
+    for kind, parts in (('slide', slide_parts), ('mockup', mockup_parts)):
+        for p in parts:
+            for s in p['selectors']:
+                for comp in re.split(r'[\s>+~]+', s):
+                    cs = re.findall(r'\.([\w-]+)', comp)
+                    if cs and len(cs) == 1 and not re.search(r'^[a-zA-Z]', comp) and cs[0] in GENERIC:
+                        E.append('%s %s: generic class ".%s" used on its own in CSS; give it the slide prefix "%s-"' % (kind, p['id'], cs[0], p['prefix']))
+            for c in p['defined']:
+                if c in p['known']:
+                    # a part that styles a library class with its own prefix (".td-c" on a slide prefixed "td") has picked a
+                    # prefix the library already uses: the library CSS leaks in (found on the ReelFlow v2 run, 19 Nov 2026)
+                    if c.startswith(p['prefix'] + '-') and not c.startswith('b-'):
+                        E.append('%s %s: prefix "%s" collides with the component library (".%s" already exists there); pick another prefix' % (kind, p['id'], p['prefix'], c))
+                    continue
+                if not c.startswith(p['prefix'] + '-'):
+                    E.append('%s %s: new class ".%s" must start with the prefix "%s-"' % (kind, p['id'], c, p['prefix']))
+    # undefined classes (typos)
+    defined = set(classes_in_css(final_css)) | RUNTIME
+    used = set()
+    for c in re.findall(r'class="([^"]*)"', body): used.update(c.split())
+    undef = sorted(c for c in used - defined if not c.startswith('ly-'))
+    if undef: W.append('classes with no CSS (typo or unused): %s' % ', '.join(undef[:40]))
+    # 6 hard-coded colours outside tokens
+    for m in re.finditer(r'([^{}]+)\{([^{}]*)\}', strip_token_blocks(final_css)):
+        sel, decls = m.group(1).strip(), m.group(2)
+        clean = re.sub(r'url\((["\']?)data:[^)]*\)', 'url()', decls)
+        if re.search(r'#[0-9a-fA-F]{3,8}\b|rgba?\(\s*\d', clean):
+            E.append('hard-coded colour outside tokens in "%s": %s' % (sel[:60], clean[:120]))
+    for m in re.finditer(r'style="([^"]*)"', body):
+        if re.search(r'#[0-9a-fA-F]{3,8}\b|rgba?\(\s*\d', m.group(1)): E.append('hard-coded colour in inline style: %s' % m.group(1)[:80])
+    for m in re.finditer(r'\s(fill|stroke|stop-color)="(#[0-9a-fA-F]{3,8}|rgb[^"]*)"', body):
+        E.append('hard-coded colour attribute %s="%s" in markup: use a class or currentColor' % (m.group(1), m.group(2)))
+    # 7 highlight
+    if not re.search(r'\.hl\{[^}]*86%', final_css) or not re.search(r'@keyframes hl\{to\{background-size:100% 86%', final_css):
+        E.append('highlight: .hl must paint at 86% height (background-size 100% 86%)')
+    for sid in slide_ids:
+        sec = re.search(r'<section\b[^>]*\bid="%s".*?</section>' % re.escape(sid), body, re.S).group(0)
+        h2 = re.findall(r'<h2\b.*?</h2>', sec, re.S)
+        if base_id(sid) not in ('cover', 'thanks') and h2:
+            n = h2[0].count('class="hl"')
+            if n != 1: W.append('slide %s: headline should carry exactly one .hl phrase (found %d)' % (sid, n))
+            if re.search(r'\.\s*</h2>', h2[0]): W.append('slide %s: headline ends with a full stop' % sid)
+        # 13 builds
+        steps = re.search(r'data-steps="(\d+)"', sec[:400])
+        bs = [int(x) for x in re.findall(r'data-b="(\d+)"', sec)]
+        if bs and (not steps or max(bs) > int(steps.group(1))): E.append('slide %s: data-b %d without matching data-steps' % (sid, max(bs)))
+        if steps and not bs: W.append('slide %s: data-steps set but no data-b elements' % sid)
+        if 'aria-label=' not in sec[:300]: W.append('slide %s: add aria-label to the section' % sid)
+        # prices
+        prices = re.findall(r'[£$€]\s?[\d,.]+k?', visible_text(sec))
+        if prices:
+            if any(re.search(r'99\b', p) for p in prices): W.append('slide %s: round prices only (%s)' % (sid, prices))
+            if not re.search(r'ex VAT', visible_text(sec)) and cfg.get('prices_shown'): W.append('slide %s: prices shown without "ex VAT"' % sid)
+    # 8 timeline geometry
+    if 'class="tl"' in body or "class=\"tl " in body:
+        need = [r'\.tl\{[^}]*--tl-h', r'\.tl-bar\{[^}]*top:calc\(var\(--tl-h\)', r'\.tl-p\{[^}]*bottom:calc\(var\(--tl-h\)', r'\.tl-p\.dn\{[^}]*top:calc\(var\(--tl-h\)']
+        for n in need:
+            if not re.search(n, final_css): E.append('timeline: geometry must come from one --tl-h variable (%s)' % n)
+        for p in slide_parts:
+            if re.search(r'\.tl(-bar|-p)?[^{]*\{[^}]*(top|bottom|height)\s*:\s*\d', p['css']): E.append('slide %s: do not set .tl height/top/bottom in px; set --tl-h' % p['id'])
+    # 12 closing slide
+    if 'thanks' in slide_ids:
+        sec = re.search(r'<section\b[^>]*\bid="thanks".*?</section>', body, re.S).group(0)
+        if '@' in visible_text(sec): E.append('closing slide: no emails')
+    # 15 external resources
+    for m in re.finditer(r'(src|href)="(https?:[^"]+)"', html):
+        if 'fonts.googleapis.com' in m.group(2) or 'fonts.gstatic.com' in m.group(2): continue
+        if m.group(1) == 'src' or 'stylesheet' in html[max(0, m.start() - 60):m.start()]:
+            E.append('external resource: %s' % m.group(2)[:80])
+    return E, W
+
+def classes_in_css(css):
+    out = []
+    def walk(ns):
+        for n in ns:
+            if n['t'] == 'rule': out.extend(classes_in(n['sel']))
+            elif n['t'] == 'at': walk(n['children'])
+    walk(parse_css(re.sub(r'@font-face\{[^}]*\}', '', css)))
+    return out
+
+def strip_token_blocks(css):
+    css = re.sub(r'/\*.*?\*/', '', css, flags=re.S)
+    css = re.sub(r'@font-face\{[^}]*\}', '', css)
+    css = re.sub(r'(^|\n)\s*(:root|html\[data-theme="light"\]|html\.wl)\s*\{[^}]*\}', '\n', css)
+    return css
+
+# ---------------------------------------------------------------- parts
+def load_part(path, kind, known_classes):
+    raw = strip_comments_keep_prefix(read(path))
+    pm = re.search(r'<!--\s*prefix:\s*([\w-]+)\s*-->', raw)
+    styles = re.findall(r'<style\b[^>]*>(.*?)</style>', raw, re.S)
+    markup = re.sub(r'<style\b[^>]*>.*?</style>', '', raw, flags=re.S)
+    markup = strip_comments(markup).strip()
+    if kind == 'slide':
+        m = re.search(r'<section\b[^>]*\bid="([^"]+)"', markup)
+    else:
+        m = re.search(r'<div\b[^>]*\bid="(mz-[^"]+)"', markup)
+    if not m: raise SystemExit('%s: no %s with an id' % (path, 'section' if kind == 'slide' else 'div.mz'))
+    pid = m.group(1)
+    prefix = pm.group(1) if pm else re.sub(r'[^a-z]', '', pid.replace('mz-', ''))[:3]
+    css = '\n'.join(styles)
+    sels = []
+    for n in parse_css(css):
+        if n['t'] == 'rule': sels += [s.strip() for s in split_top(n['sel'], ',')]
+        elif n['t'] == 'at':
+            for c in n.get('children', []):
+                if c['t'] == 'rule': sels += [s.strip() for s in split_top(c['sel'], ',')]
+    defined = set()
+    for s in sels: defined.update(classes_in(s))
+    scoped = scope_css(css, '#' + pid) if css.strip() else ''
+    return {'id': pid, 'prefix': prefix, 'markup': markup, 'css': css, 'scoped': scoped, 'selectors': sels,
+            'defined': defined, 'known': known_classes | RUNTIME | {'slide', 'mz'}, 'path': path}
+
+def strip_comments_keep_prefix(h):
+    return re.sub(r'<!--(?!\s*(prefix:|@component)).*?-->', '', h, flags=re.S)
+
+# ---------------------------------------------------------------- build
+NO_GATE = False
+BRAND_CHECK = False   # --brand-check: a preview to show the user accent and logo before they confirm
+
+def build(deck_dir, theme, white_label, out=None, only=None, lint_only=False, library=None, review=False):
+    cfg = json.load(open(os.path.join(deck_dir, 'deck.json'), encoding='utf-8'))
+    shell = read(SHELL)
+    if library:
+        comp_css = read(library)
+    else:
+        comp_html = read(COMPONENTS)
+        comp_css = re.search(r'<style id="g10x-components">(.*?)</style>', comp_html, re.S).group(1)
+    shell_css = re.search(r'<style id="g10x-core">(.*?)</style>', shell, re.S).group(1)
+    known = set(classes_in_css(comp_css)) | set(classes_in_css(shell_css))
+
+    slides = [load_part(os.path.join(deck_dir, p), 'slide', known) for p in cfg['slides']]
+    if only: slides = [s for s in slides if s['id'] in only or s['id'] in ('cover',)]
+    mz_files = cfg.get('mockups')
+    if mz_files is None:
+        d = os.path.join(deck_dir, 'mockups')
+        mz_files = ['mockups/' + f for f in sorted(os.listdir(d))] if os.path.isdir(d) else []
+    mockups = [load_part(os.path.join(deck_dir, p), 'mockup', known) for p in mz_files]
+    slide_markup = '\n\n'.join(s['markup'] for s in slides)
+    if review:
+        theme = 'light'                 # the page opens on slide 1, which is light
+    if only:
+        used = set(re.findall(r'data-open="([^"]+)"', slide_markup))
+        mockups = [m for m in mockups if m['id'] in used]
+    mz_markup = '\n\n'.join(m['markup'] for m in mockups)
+
+    client = cfg['client']
+    team = 'Growth team' if white_label else 'Growth10x'
+    def make_lockup(th):
+        logo_path = (cfg.get('logo') or {}).get(th)
+        if logo_path and os.path.exists(os.path.join(deck_dir, logo_path)):
+            logo = '<img class="lk-img in" style="--d:.15s" src="%s" alt="%s">' % (data_uri(os.path.join(deck_dir, logo_path)), client)
+        else:
+            logo = '<span class="lk-t in" style="--d:.15s">%s</span>' % client
+        return ('<h1 class="lockup" data-g10x>%s<span class="x in" style="--d:.35s" aria-hidden="true">&#215;</span>'
+                '<span class="wm gx in" style="--d:.45s">Growth<span class="ten">10x</span></span></h1>') % logo
+    lockup = make_lockup(theme)
+    acc_css, acc_tokens = accent_css(cfg['accent'])
+    n_sections = len(slides)
+    idmap = {}
+    if review:
+        # slides 1..n in light, then the same slides again in dark with -d ids: one file, one link
+        idmap = {i: i + REVIEW_SUFFIX for i in re.findall(r'\sid="([^"]+)"', slide_markup)}
+        light = [set_section_theme(s['markup'], 'light').replace('{{LOCKUP}}', make_lockup('light')) for s in slides]
+        dark = [set_section_theme(dark_copy(s['markup'], idmap, len(slides)), 'dark').replace('{{LOCKUP}}', make_lockup('dark'))
+                for s in slides]
+        slide_markup = '\n\n'.join(light + dark)
+        n_sections = 2 * len(slides)
+
+    h = shell
+    rep = {
+        '{{TITLE}}': cfg.get('title', client + ' growth plan'),
+        '{{THEME}}': theme,
+        '{{HTML_CLASS}}': 'wl' if white_label else '',
+        '{{ACCENT_CSS}}': acc_css,
+        '{{SLIDES}}': slide_markup,
+        '{{MOCKUPS}}': mz_markup,
+        '{{CTR}}': '01 / %02d' % n_sections,
+    }
+    for k, v in rep.items(): h = h.replace(k, v)
+    # tokens usable inside slide parts
+    prepared = 'Prepared for %s, %s' % (client, cfg.get('month_year', ''))
+    for k, v in {'{{LOCKUP}}': lockup, '{{CLIENT}}': client, '{{PREPARED_FOR}}': cfg.get('prepared_for', client),
+                 '{{MONTH_YEAR}}': cfg.get('month_year', ''), '{{TEAM}}': team, '{{PREPARED_LINE}}': prepared}.items():
+        h = h.replace(k, v)
+    if white_label:
+        h = remove_marked(h)
+        h = re.sub(r'<!-- g10x-fonts -->.*?<!-- /g10x-fonts -->', '', h, flags=re.S)
+        h = re.sub(r'@font-face\{font-family:\'Bricolage Grotesque\'[^}]*\}', '', h)
+    else:
+        h = h.replace(' data-g10x', '')
+
+    # CSS: component library tree-shaken to what the deck uses, then per-slide scoped CSS, then de-duplicated
+    part_css = '\n'.join('/* %s */\n%s' % (p['id'], p['scoped']) for p in slides + mockups if p['scoped'])
+    if library:   # component library build: keep every group and its comments, no tree-shaking
+        h = h.replace('<style id="g10x-deck">\n/*{{COMPONENT_CSS}}*/', '<style id="g10x-components">\n' + comp_css + ('\n' + part_css if part_css else ''))
+    else:
+        h = re.sub(r'<!--\s*@component.*?-->\n?', '', h, flags=re.S)
+        used_css = tree_shake(comp_css, h)
+        deck_css = dedupe_css(used_css + '\n' + part_css)
+        h = h.replace('/*{{COMPONENT_CSS}}*/', deck_css)
+    if review:
+        h = dup_id_css(h, idmap)
+
+    # icons: inline only the symbols this deck uses (assets/icons.svg); unknown ids are errors
+    pre = []
+    icon_lib = {m.group(2): m.group(1) for m in re.finditer(r'(<symbol id="(i-[\w-]+)".*?</symbol>)', read(ICONS), re.S)} if os.path.exists(ICONS) else {}
+    used_icons = sorted(set(re.findall(r'href="#(i-[\w-]+)"', h)))
+    for ic in used_icons:
+        if ic not in icon_lib: pre.append('icon "%s" is not in assets/icons.svg (pick one by meaning, or add it there in the same line style)' % ic)
+    if used_icons:
+        sprite = '<svg class="g10x-icons" aria-hidden="true" style="display:none">%s</svg>' % ''.join(icon_lib[i] for i in used_icons if i in icon_lib)
+        h = re.sub(r'(<body\b[^>]*>)', lambda m: m.group(1) + '\n' + sprite, h, count=1)
+    # brand: the user confirms accent and logo before any build; the real logo goes on the cover and thanks slides
+    if not library:
+        if not cfg.get('brand_confirmed') and not BRAND_CHECK:
+            pre.append('brand: deck.json needs "brand_confirmed": true. Show the user the accent (most-used brand colour on their site, with the runner-up) and the logo on both grounds first')
+        logo = cfg.get('logo') or {}
+        if not cfg.get('logo_text_ok'):
+            for th in ('dark', 'light'):
+                lp = logo.get(th) if isinstance(logo, dict) else None
+                if not lp or not os.path.exists(os.path.join(deck_dir, lp)):
+                    pre.append('logo: no %s-ground logo file (deck.json "logo": {"%s": "assets/..."}). Download the real logo in proposal-research; set "logo_text_ok": true only if the user agreed to the name in text' % (th, th))
+    final_css = '\n'.join(re.findall(r'<style\b[^>]*>(.*?)</style>', h, re.S))
+    E, W = lint(h, cfg, slides, mockups, final_css)
+    E = pre + E
+    slug = cfg.get('slug') or re.sub(r'[^a-z0-9]+', '-', client.lower()).strip('-')
+    bdir = os.path.join(deck_dir, 'build')
+    os.makedirs(bdir, exist_ok=True)
+    label = ('review' if review else theme) + ('-wl' if white_label else '')
+    out = out or os.path.join(bdir, '%s-%s.html' % (slug, label))
+    sec_ids = re.findall(r'<section\b[^>]*\bid="([^"]+)"', h[h.index('<body'):])
+    report = {'file': out, 'theme': 'review (light then dark)' if review else theme, 'white_label': white_label, 'slides': sec_ids,
+              'mockups': [m['id'] for m in mockups], 'errors': E, 'warnings': W, 'bytes': len(h.encode()),
+              'accent': acc_tokens}
+    json.dump(report, open(os.path.join(bdir, 'lint-%s.json' % label), 'w'), indent=1)
+    if not lint_only:
+        open(out, 'w', encoding='utf-8').write(h)
+    print('%s  %d slides%s, %d mockups, %d KB' % (out, len(sec_ids), ' (%d light, then the same %d dark)' % (len(slides), len(slides)) if review else '',
+                                               len(mockups), len(h.encode()) // 1024))
+    print('accent %s: dark acc %s on-acc %s text %s | light acc %s on-acc %s text %s' % (
+        cfg['accent'], acc_tokens['dark']['--acc'], acc_tokens['dark']['--on-acc'], acc_tokens['dark']['--acc-tx'],
+        acc_tokens['light']['--acc'], acc_tokens['light']['--on-acc'], acc_tokens['light']['--acc-tx']))
+    for e in E: print('  ERROR  ' + e)
+    for w in W: print('  warn   ' + w)
+    print('  lint: %d errors, %d warnings' % (len(E), len(W)))
+    gate_ok = True
+    if not lint_only and not library and not NO_GATE:
+        # static deck gate (words, banned terms, units, client-specificity, timelines, interaction, layouts, logo)
+        import subprocess
+        r = subprocess.run([sys.executable, os.path.join(HERE, 'deck_check.py'), out, '--deck', deck_dir,
+                            '--out', os.path.join(bdir, 'gate-%s.json' % label)], capture_output=True, text=True)
+        print(r.stdout.rstrip())
+        gate_ok = r.returncode == 0
+    return not E and gate_ok
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('deck_dir')
+    ap.add_argument('--theme', choices=['dark', 'light', 'both'])
+    ap.add_argument('--review', action='store_true', help='pilot review: light slides then the same slides dark, one file')
+    ap.add_argument('--white-label', action='store_true', default=None)
+    ap.add_argument('--out')
+    ap.add_argument('--only', help='comma list of slide ids (pilot builds)')
+    ap.add_argument('--lint-only', action='store_true')
+    ap.add_argument('--library', help=argparse.SUPPRESS)
+    ap.add_argument('--no-gate', action='store_true', help='skip the static deck gate (deck_check.py) after the build')
+    ap.add_argument('--brand-check', action='store_true', help='preview for the brand question: builds without brand_confirmed, no gate')
+    a = ap.parse_args()
+    global NO_GATE, BRAND_CHECK
+    NO_GATE = a.no_gate or a.brand_check
+    BRAND_CHECK = a.brand_check
+    cfg = json.load(open(os.path.join(a.deck_dir, 'deck.json'), encoding='utf-8'))
+    theme = a.theme or cfg.get('theme', 'dark')
+    wl = cfg.get('white_label', False) if a.white_label is None else a.white_label
+    only = set(a.only.split(',')) if a.only else None
+    review = a.review or (bool(cfg.get('review')) and not a.theme)
+    if review:
+        ok = build(a.deck_dir, 'light', wl, a.out, only, a.lint_only, a.library, review=True)
+        sys.exit(0 if ok else 1)
+    ok = True
+    for t in (['dark', 'light'] if theme == 'both' else [theme]):
+        ok = build(a.deck_dir, t, wl, a.out if theme != 'both' else None, only, a.lint_only, a.library) and ok
+    sys.exit(0 if ok else 1)
+
+if __name__ == '__main__':
+    main()
